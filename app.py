@@ -336,7 +336,9 @@ if __name__ == "__main__":
     import uvicorn
     # Use log_config=None when under pythonw to avoid isatty() NoneType crash
     is_gui_mode = isinstance(sys.stdout, io.StringIO)
+    host = os.environ.get("HOST", "127.0.0.1" if is_gui_mode else "0.0.0.0")
+    port = int(os.environ.get("PORT", 8000))
     if is_gui_mode:
-        uvicorn.run(app, host="127.0.0.1", port=8000, log_config=None)
+        uvicorn.run(app, host=host, port=port, log_config=None)
     else:
-        uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+        uvicorn.run("app:app", host=host, port=port, reload=False)
