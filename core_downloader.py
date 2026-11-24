@@ -21,12 +21,30 @@ import yt_dlp
 DEFAULT_DOWNLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "downloads"))
 DEFAULT_COOKIE_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "cookies.txt"))
 
-# Auto-initialize cookies from environment variable if deployed on cloud (Render / Docker / Railway)
+# 1. Check Render / Cloud Secret Files path (/etc/secrets/cookies.txt)
+RENDER_SECRET_COOKIE = "/etc/secrets/cookies.txt"
+if os.path.exists(RENDER_SECRET_COOKIE) and os.path.getsize(RENDER_SECRET_COOKIE) > 0:
+    DEFAULT_COOKIE_FILE = RENDER_SECRET_COOKIE
+
+# 2. Auto-initialize cookies from environment variable if deployed on cloud (Render / Docker / Railway)
 _env_cookies = os.environ.get("YOUTUBE_COOKIES") or os.environ.get("COOKIES_TXT")
-if _env_cookies and not os.path.exists(DEFAULT_COOKIE_FILE):
+if _env_cookies:
+    _clean_cookies = _env_cookies
+    if "\\n" in _clean_cookies:
+        _clean_cookies = _clean_cookies.replace("\\n", "\n").replace("\\r", "\r")
     try:
-        with open(DEFAULT_COOKIE_FILE, "w", encoding="utf-8") as _f:
-            _f.write(_env_cookies)
+        import base64
+        if not _clean_cookies.startswith("# Netscape") and len(_clean_cookies) > 20:
+            try:
+                decoded = base64.b64decode(_clean_cookies).decode("utf-8")
+                if "youtube.com" in decoded:
+                    _clean_cookies = decoded
+            except Exception:
+                pass
+        target_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "cookies.txt"))
+        with open(target_path, "w", encoding="utf-8") as _f:
+            _f.write(_clean_cookies)
+        DEFAULT_COOKIE_FILE = target_path
     except Exception:
         pass
 
