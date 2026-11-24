@@ -84,11 +84,11 @@ def resolve_filepath(path_str: Optional[str], fallback_dir: str = DEFAULT_DOWNLO
 def format_yt_error(err: Exception) -> str:
     """Formats raw yt-dlp error into clear, actionable guidance."""
     err_str = str(err)
-    if "confirm you’re not a bot" in err_str or "confirm you're not a bot" in err_str:
+    if "Failed to extract any player response" in err_str or "The page needs to be reloaded" in err_str or "confirm you’re not a bot" in err_str or "confirm you're not a bot" in err_str:
         return (
-            "YouTube Bot Check Triggered: YouTube requires sign-in verification for this video.\n"
+            "YouTube Verification / Datacenter Block Triggered: YouTube requires sign-in verification for this video.\n"
             "Solution: Export your YouTube cookies using the 'Get cookies.txt LOCALLY' browser extension, "
-            "then upload it in the 'Cookies & Authentication' section (or place it as 'cookies.txt' in the app folder)."
+            "then upload it in the '🍪 Cookies & Bot Bypass' tab. Once active, all bot checks are bypassed."
         )
     if "Could not copy Chrome cookie database" in err_str:
         return (
@@ -171,7 +171,23 @@ def fetch_video_info(url: str, cookiefile: Optional[str] = None, browser: Option
                 else:
                     raise ValueError("The provided playlist contains no videos.")
     except Exception as e:
-        raise ValueError(format_yt_error(e))
+        err_msg = str(e)
+        if "Failed to extract any player response" in err_msg or "The page needs to be reloaded" in err_msg:
+            # Datacenter / Cloud server block fallback: query mobile player clients
+            opts["extractor_args"] = {"youtube": {"player_client": ["android", "ios", "mweb"]}}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl_fb:
+                    info = ydl_fb.extract_info(url, download=False)
+                    if not info:
+                        raise ValueError("Could not retrieve video information.")
+                    if "_type" in info and info["_type"] == "playlist":
+                        entries = list(info.get("entries", []))
+                        if entries:
+                            info = entries[0]
+            except Exception as e2:
+                raise ValueError(format_yt_error(e2))
+        else:
+            raise ValueError(format_yt_error(e))
 
     duration = info.get("duration") or 0
     formats = info.get("formats", [])
@@ -239,20 +255,26 @@ def fetch_video_info(url: str, cookiefile: Optional[str] = None, browser: Option
 
         # 2. Combined / Progressive Streams (Pre-muxed video + audio)
         elif vcodec != "none" and acodec != "none" and height:
-            progressive_streams.append({
+            prog_stream = {
                 "format_id": fid,
                 "height": height,
                 "width": width,
                 "fps": fps,
                 "quality_label": f"{height}p",
+                "dynamic_range": "SDR",
                 "ext": ext,
                 "vcodec": vcodec,
                 "acodec": acodec,
                 "filesize": filesize,
+                "total_estimated_size": filesize,
                 "formatted_size": format_bytes(filesize),
                 "tbr": tbr,
                 "needs_mux": False
-            })
+            }
+            progressive_streams.append(prog_stream)
+            key = (height, fps or 30, "SDR")
+            if key not in video_streams_map:
+                video_streams_map[key] = prog_stream
 
     sorted_video_streams = sorted(
         video_streams_map.values(),
@@ -429,7 +451,7 @@ def execute_download(
             audio_stream_selector = "bestaudio/best"
 
         if selected_format_id:
-            opts["format"] = f"{selected_format_id}+{audio_stream_selector}"
+            opts["format"] = f"{selected_format_id}+{audio_stream_selector}/{selected_format_id}"
         else:
             quality = task.options.get("quality", "best")
             if quality == "best":
@@ -443,10 +465,16 @@ def execute_download(
 
         if container in ["mp4", "mkv", "webm"]:
             opts["merge_output_format"] = container
-
-        opts["postprocessor_args"] = {
-            "ffmpeg": ["-c", "copy"]
-        }
+            if container == "mp4":
+                # Ensure moov atom is moved to front (+faststart) so browsers and players can seek/play immediately without full download
+                opts["postprocessor_args"] = {
+                    "Merger": ["-c", "copy", "-movflags", "+faststart"],
+                    "Fixup": ["-movflags", "+faststart"]
+                }
+            else:
+                opts["postprocessor_args"] = {
+                    "Merger": ["-c", "copy"]
+                }
 
     elif mode == "audio":
         opts["format"] = "bestaudio/best"

@@ -19,8 +19,8 @@ import subprocess
 import mimetypes
 import re
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -225,10 +225,77 @@ def resolve_filepath(path_str: str) -> Optional[str]:
                 return os.path.join(core_downloader.DEFAULT_DOWNLOAD_DIR, f)
     return None
 
+def send_bytes_range_requests(file_path: str, request: Request, filename: Optional[str] = None):
+    """
+    Serves files with full HTTP 206 Partial Content (Byte Range) support.
+    Enables instant seeking, header probing (e.g. MP4 moov atom), and in-browser video playback.
+    """
+    file_size = os.path.getsize(file_path)
+    range_header = request.headers.get("range")
+    mime, _ = mimetypes.guess_type(file_path)
+    if not mime:
+        mime = "video/mp4" if file_path.lower().endswith(".mp4") else "application/octet-stream"
+
+    out_name = filename or os.path.basename(file_path)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{out_name}"',
+    }
+
+    if range_header:
+        try:
+            # Parse Range: bytes=start-end
+            h_val = range_header.strip().replace("bytes=", "")
+            parts = h_val.split("-")
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+
+            if start >= file_size:
+                raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+            end = min(end, file_size - 1)
+            content_length = (end - start) + 1
+
+            def chunk_generator():
+                with open(file_path, "rb") as f:
+                    f.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk_size = min(128 * 1024, remaining)
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            headers["Content-Length"] = str(content_length)
+            return StreamingResponse(
+                chunk_generator(),
+                status_code=206,
+                headers=headers,
+                media_type=mime
+            )
+        except (ValueError, IndexError):
+            pass
+
+    # Full content delivery
+    headers["Content-Length"] = str(file_size)
+    def full_generator():
+        with open(file_path, "rb") as f:
+            while chunk := f.read(128 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        full_generator(),
+        status_code=200,
+        headers=headers,
+        media_type=mime
+    )
+
 @app.get("/api/file/{task_id}")
 @app.head("/api/file/{task_id}")
-async def download_file(task_id: str):
-    """Streams or serves the downloaded file directly to the user's browser."""
+async def download_file(task_id: str, request: Request):
+    """Streams or serves the downloaded file directly to the user's browser with range seeking."""
     if task_id not in TASKS:
         raise HTTPException(status_code=404, detail="Task not found")
     task = TASKS[task_id]
@@ -236,64 +303,65 @@ async def download_file(task_id: str):
     if task.status != "finished" or not resolved or not os.path.exists(resolved):
         raise HTTPException(status_code=400, detail="File is not ready or does not exist.")
     
-    mime, _ = mimetypes.guess_type(resolved)
-    if not mime:
-        mime = "video/mp4" if resolved.lower().endswith(".mp4") else "application/octet-stream"
-
-    return FileResponse(
-        path=resolved,
-        filename=task.filename or os.path.basename(resolved),
-        media_type=mime
-    )
+    return send_bytes_range_requests(resolved, request, filename=task.filename or os.path.basename(resolved))
 
 @app.get("/api/stream")
 @app.head("/api/stream")
-async def stream_file(path: str):
-    """Streams a file by path for in-browser video playback."""
+async def stream_file(path: str, request: Request):
+    """Streams a file by path for in-browser video playback with HTTP 206 Range seeking."""
     resolved = resolve_filepath(path)
     if not resolved or not os.path.exists(resolved):
         raise HTTPException(status_code=404, detail="File does not exist on disk")
     
-    mime, _ = mimetypes.guess_type(resolved)
-    if not mime:
-        mime = "video/mp4" if resolved.lower().endswith(".mp4") else "application/octet-stream"
-
-    return FileResponse(
-        path=resolved,
-        filename=os.path.basename(resolved),
-        media_type=mime
-    )
+    return send_bytes_range_requests(resolved, request, filename=os.path.basename(resolved))
 
 @app.post("/api/open-folder")
 async def open_download_folder(req: ActionRequest):
     """Opens directory or highlights file in Windows File Explorer."""
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "cloud_mode": True,
+            "message": "App is running on a cloud server. Use 'Direct Browser Download' to save files to your computer."
+        }
+
     target = req.path or core_downloader.DEFAULT_DOWNLOAD_DIR
     target = target.strip('"').strip("'")
     resolved = resolve_filepath(target) or target
 
-    if os.path.isfile(resolved):
-        if sys.platform == "win32":
+    try:
+        if os.path.isfile(resolved):
             norm = os.path.normpath(resolved)
+            # Use explorer /select directly without cmd wrapper
             subprocess.Popen(f'explorer.exe /select,"{norm}"', shell=True)
-        return {"success": True, "message": f"Selected file in Explorer: {resolved}"}
+            return {"success": True, "message": f"Selected file in Explorer: {norm}"}
 
-    folder = resolved if os.path.isdir(resolved) else os.path.dirname(resolved)
-    if not os.path.exists(folder):
-        folder = core_downloader.DEFAULT_DOWNLOAD_DIR
+        folder = resolved if os.path.isdir(resolved) else os.path.dirname(resolved)
+        if not os.path.exists(folder):
+            folder = core_downloader.DEFAULT_DOWNLOAD_DIR
 
-    if os.path.exists(folder):
-        if sys.platform == "win32":
+        if os.path.exists(folder):
             norm = os.path.normpath(folder)
             try:
                 os.startfile(norm)
             except Exception:
                 subprocess.Popen(f'explorer.exe "{norm}"', shell=True)
-        return {"success": True, "message": f"Opened folder: {folder}"}
+            return {"success": True, "message": f"Opened folder: {norm}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open explorer: {str(e)}")
+
     raise HTTPException(status_code=404, detail="Folder does not exist")
 
 @app.post("/api/open-file")
 async def open_downloaded_file(req: ActionRequest):
-    """Opens the file in default player."""
+    """Opens the file in default media player."""
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "cloud_mode": True,
+            "message": "App is running on a cloud server. Use 'Play in Browser' or 'Direct Browser Download'."
+        }
+
     target = req.path
     if not target:
         raise HTTPException(status_code=400, detail="No file path provided")
@@ -302,13 +370,12 @@ async def open_downloaded_file(req: ActionRequest):
     if not resolved or not os.path.exists(resolved):
         raise HTTPException(status_code=404, detail=f"File does not exist: {target}")
 
-    if sys.platform == "win32":
-        norm = os.path.normpath(resolved)
-        try:
-            os.startfile(norm)
-        except Exception:
-            subprocess.Popen(f'cmd.exe /c start "" "{norm}"', shell=True)
-    return {"success": True, "message": f"Opened file: {resolved}"}
+    norm = os.path.normpath(resolved)
+    try:
+        os.startfile(norm)
+    except Exception:
+        subprocess.Popen(f'cmd.exe /c start "" "{norm}"', shell=True)
+    return {"success": True, "message": f"Opened file in player: {norm}"}
 
 @app.get("/api/default-dir")
 async def get_default_dir():

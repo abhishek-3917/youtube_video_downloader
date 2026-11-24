@@ -257,7 +257,7 @@ async function fetchVideoInfo() {
     renderVideoInfo(currentVideoInfo);
   } catch (error) {
     showStatus(`Error: ${error.message}`, 'error');
-    if (error.message.includes('Bot Check') || error.message.includes('cookies')) {
+    if (error.message.includes('Bot') || error.message.includes('cookies') || error.message.includes('Block') || error.message.includes('player response') || error.message.includes('Verification')) {
       const cookiesTabBtn = document.querySelector('[data-tab="tab-cookies"]');
       if (cookiesTabBtn) cookiesTabBtn.click();
     }
