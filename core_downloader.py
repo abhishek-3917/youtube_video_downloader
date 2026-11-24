@@ -133,10 +133,16 @@ def get_base_ydl_opts(cookiefile: Optional[str] = None, browser: Optional[str] =
 
 def calculate_format_size(f: Dict[str, Any], duration: Optional[int]) -> int:
     """Accurately calculates or estimates size of a format in bytes."""
+    if not isinstance(f, dict):
+        return 0
     fs = f.get("filesize") or f.get("filesize_approx")
     if fs and fs > 0:
         return int(fs)
-    tbr = f.get("tbr") or (f.get("vbr", 0) + f.get("abr", 0))
+    tbr = f.get("tbr")
+    if not tbr:
+        vbr = f.get("vbr") or 0
+        abr = f.get("abr") or 0
+        tbr = (vbr or 0) + (abr or 0)
     if tbr and duration and duration > 0:
         return int((tbr * 1000 / 8) * duration)
     return 0
@@ -210,7 +216,7 @@ def fetch_video_info(url: str, cookiefile: Optional[str] = None, browser: Option
                 quality_label += f" {dynamic_range}"
 
             key = (height, fps, dynamic_range)
-            total_size_approx = filesize + best_audio_size if filesize and best_audio_size else filesize
+            total_size_approx = ((filesize or 0) + (best_audio_size or 0)) if (filesize or best_audio_size) else 0
 
             stream_data = {
                 "format_id": fid,
