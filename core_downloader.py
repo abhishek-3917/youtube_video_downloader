@@ -694,13 +694,11 @@ def execute_download(
         except Exception as primary_err:
             err_text = str(primary_err).lower()
             if any(k in err_text for k in ["bot", "player response", "reloaded", "403", "forbidden"]) and not task._cancel_requested:
-                # Automatic bypass fallback using mobile/tv client
+                # Automatic bypass fallback using mobile client with progressive/best stream
                 fallback_opts = opts.copy()
-                fallback_opts["extractor_args"] = {"youtube": {"player_client": ["tv", "mweb", "android"]}}
-                if selected_format_id:
-                    fallback_opts["format"] = f"{selected_format_id}+{audio_stream_selector}/{selected_format_id}/best"
-                else:
-                    fallback_opts["format"] = f"bestvideo+{audio_stream_selector}/best"
+                fallback_opts["extractor_args"] = {"youtube": {"player_client": ["android", "ios", "mweb"]}}
+                # Mobile endpoints only serve pre-muxed progressive streams (like format 18 / 360p) without DASH
+                fallback_opts["format"] = "18/best[ext=mp4]/bestvideo+bestaudio/best"
                 do_download(fallback_opts)
             else:
                 raise primary_err
