@@ -21,6 +21,15 @@ import yt_dlp
 DEFAULT_DOWNLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "downloads"))
 DEFAULT_COOKIE_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "cookies.txt"))
 
+# Auto-initialize cookies from environment variable if deployed on cloud (Render / Docker / Railway)
+_env_cookies = os.environ.get("YOUTUBE_COOKIES") or os.environ.get("COOKIES_TXT")
+if _env_cookies and not os.path.exists(DEFAULT_COOKIE_FILE):
+    try:
+        with open(DEFAULT_COOKIE_FILE, "w", encoding="utf-8") as _f:
+            _f.write(_env_cookies)
+    except Exception:
+        pass
+
 def format_bytes(size_bytes: Optional[int]) -> str:
     """Format bytes into human-readable string (e.g. 1.25 GB)."""
     if not size_bytes or size_bytes <= 0:
@@ -112,6 +121,11 @@ def get_base_ydl_opts(cookiefile: Optional[str] = None, browser: Optional[str] =
         "logtostderr": False,
         "js_runtimes": {"node": {}},
         "remote_components": {"ejs:github": {}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web", "tv"]
+            }
+        },
         "buffersize": 1024 * 1024,  # 1MB buffer
         "retries": 15,
         "fragment_retries": 15,
@@ -171,23 +185,7 @@ def fetch_video_info(url: str, cookiefile: Optional[str] = None, browser: Option
                 else:
                     raise ValueError("The provided playlist contains no videos.")
     except Exception as e:
-        err_msg = str(e)
-        if "Failed to extract any player response" in err_msg or "The page needs to be reloaded" in err_msg:
-            # Datacenter / Cloud server block fallback: query mobile player clients
-            opts["extractor_args"] = {"youtube": {"player_client": ["android", "ios", "mweb"]}}
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl_fb:
-                    info = ydl_fb.extract_info(url, download=False)
-                    if not info:
-                        raise ValueError("Could not retrieve video information.")
-                    if "_type" in info and info["_type"] == "playlist":
-                        entries = list(info.get("entries", []))
-                        if entries:
-                            info = entries[0]
-            except Exception as e2:
-                raise ValueError(format_yt_error(e2))
-        else:
-            raise ValueError(format_yt_error(e))
+        raise ValueError(format_yt_error(e))
 
     duration = info.get("duration") or 0
     formats = info.get("formats", [])
@@ -255,26 +253,20 @@ def fetch_video_info(url: str, cookiefile: Optional[str] = None, browser: Option
 
         # 2. Combined / Progressive Streams (Pre-muxed video + audio)
         elif vcodec != "none" and acodec != "none" and height:
-            prog_stream = {
+            progressive_streams.append({
                 "format_id": fid,
                 "height": height,
                 "width": width,
                 "fps": fps,
                 "quality_label": f"{height}p",
-                "dynamic_range": "SDR",
                 "ext": ext,
                 "vcodec": vcodec,
                 "acodec": acodec,
                 "filesize": filesize,
-                "total_estimated_size": filesize,
                 "formatted_size": format_bytes(filesize),
                 "tbr": tbr,
                 "needs_mux": False
-            }
-            progressive_streams.append(prog_stream)
-            key = (height, fps or 30, "SDR")
-            if key not in video_streams_map:
-                video_streams_map[key] = prog_stream
+            })
 
     sorted_video_streams = sorted(
         video_streams_map.values(),
@@ -451,7 +443,7 @@ def execute_download(
             audio_stream_selector = "bestaudio/best"
 
         if selected_format_id:
-            opts["format"] = f"{selected_format_id}+{audio_stream_selector}/{selected_format_id}"
+            opts["format"] = f"{selected_format_id}+{audio_stream_selector}"
         else:
             quality = task.options.get("quality", "best")
             if quality == "best":
@@ -465,16 +457,10 @@ def execute_download(
 
         if container in ["mp4", "mkv", "webm"]:
             opts["merge_output_format"] = container
-            if container == "mp4":
-                # Ensure moov atom is moved to front (+faststart) so browsers and players can seek/play immediately without full download
-                opts["postprocessor_args"] = {
-                    "Merger": ["-c", "copy", "-movflags", "+faststart"],
-                    "Fixup": ["-movflags", "+faststart"]
-                }
-            else:
-                opts["postprocessor_args"] = {
-                    "Merger": ["-c", "copy"]
-                }
+
+        opts["postprocessor_args"] = {
+            "ffmpeg": ["-c", "copy"]
+        }
 
     elif mode == "audio":
         opts["format"] = "bestaudio/best"
