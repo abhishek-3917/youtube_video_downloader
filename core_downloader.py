@@ -91,41 +91,28 @@ def resolve_filepath(path_str: Optional[str], fallback_dir: str = DEFAULT_DOWNLO
     return None
 
 def format_yt_error(err: Exception) -> str:
-    """Formats raw yt-dlp error into clear, actionable guidance."""
+    """Formats raw yt-dlp error into clear, user-friendly guidance."""
     err_str = str(err)
-    if "Failed to extract any player response" in err_str or "The page needs to be reloaded" in err_str or "confirm you’re not a bot" in err_str or "confirm you're not a bot" in err_str:
-        return (
-            "YouTube Verification / Datacenter Block Triggered: YouTube requires sign-in verification for this video.\n"
-            "Solution: Export your YouTube cookies using the 'Get cookies.txt LOCALLY' browser extension, "
-            "then upload it in the '🍪 Cookies & Bot Bypass' tab. Once active, all bot checks are bypassed."
-        )
-    if "Could not copy Chrome cookie database" in err_str:
-        return (
-            "Chrome Database Lock: Chrome locks its cookies while running. "
-            "Please completely close all Chrome windows, or export a 'cookies.txt' file instead."
-        )
     if "Sign in to confirm your age" in err_str:
-        return (
-            "Age-Restricted Video: YouTube requires an authenticated account to verify age. "
-            "Please provide cookies.txt from a verified account."
-        )
-    return err_str
+        return "Age-Restricted Video: This video requires age verification on YouTube."
+    if "Private video" in err_str:
+        return "This video is private."
+    if "Video unavailable" in err_str:
+        return "This video is unavailable or has been removed."
+    if "Could not copy Chrome cookie database" in err_str:
+        return "Chrome Database Lock: Please close Chrome windows before using browser cookies."
+    return f"Download error: {err_str}"
 
 def get_base_ydl_opts(cookiefile: Optional[str] = None, browser: Optional[str] = None) -> Dict[str, Any]:
-    """Base options for yt-dlp configured for maximum speed, zero size limit, and authentication."""
+    """Base options for yt-dlp configured for maximum speed, zero size limit, and automatic JS challenge solving."""
     opts = {
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
         "ignoreerrors": False,
         "logtostderr": False,
-        "js_runtimes": {"node": {}},
+        "js_runtimes": {"deno": {}, "node": {}},
         "remote_components": {"ejs:github": {}},
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb", "web", "tv"]
-            }
-        },
         "buffersize": 1024 * 1024,  # 1MB buffer
         "retries": 15,
         "fragment_retries": 15,
@@ -133,7 +120,7 @@ def get_base_ydl_opts(cookiefile: Optional[str] = None, browser: Optional[str] =
         "concurrent_fragment_downloads": 8,
     }
 
-    # Cookie configuration: check explicit cookiefile or default workspace cookies.txt
+    # Cookie configuration: check explicit cookiefile, default cookies.txt, or env variable
     effective_cookiefile = cookiefile
     if not effective_cookiefile and os.path.exists(DEFAULT_COOKIE_FILE):
         effective_cookiefile = DEFAULT_COOKIE_FILE
@@ -164,28 +151,51 @@ def calculate_format_size(f: Dict[str, Any], duration: Optional[int]) -> int:
 def fetch_video_info(url: str, cookiefile: Optional[str] = None, browser: Optional[str] = None) -> Dict[str, Any]:
     """
     Extracts complete metadata and categorized formats for a given YouTube URL.
-    Categorizes streams into:
-    1. Video Streams (with audio merged using ffmpeg stream copy, no compression)
-    2. Audio Streams (raw untouched, or lossless/high-bitrate conversions)
-    3. Pre-muxed Progressive Streams
+    Uses multi-tier automatic client bypass to overcome datacenter and bot restrictions without requiring user cookies.
     """
     opts = get_base_ydl_opts(cookiefile=cookiefile, browser=browser)
     opts["extract_flat"] = False
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise ValueError("Could not retrieve video information.")
-            
-            if "_type" in info and info["_type"] == "playlist":
-                entries = list(info.get("entries", []))
-                if entries:
-                    info = entries[0]
-                else:
-                    raise ValueError("The provided playlist contains no videos.")
-    except Exception as e:
-        raise ValueError(format_yt_error(e))
+    info = None
+    last_err = None
+
+    # Multi-client automated bypass ladder:
+    # 1. Unconstrained default (TV Samsung + VisionOS + Web with EJS challenge solver)
+    # 2. TV + MWeb fallback (bypasses datacenter blocks)
+    # 3. Android + iOS fallback
+    # 4. Web Embedded fallback
+    bypass_clients = [
+        None,
+        ["tv", "visionos", "mweb"],
+        ["android", "ios"],
+        ["web_embedded"]
+    ]
+
+    for clients in bypass_clients:
+        cur_opts = opts.copy()
+        if clients:
+            cur_opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        else:
+            cur_opts.pop("extractor_args", None)
+
+        try:
+            with yt_dlp.YoutubeDL(cur_opts) as ydl:
+                res = ydl.extract_info(url, download=False)
+                if res:
+                    if "_type" in res and res["_type"] == "playlist":
+                        entries = list(res.get("entries", []))
+                        if entries:
+                            info = entries[0]
+                            break
+                    else:
+                        info = res
+                        break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if not info:
+        raise ValueError(format_yt_error(last_err or Exception("Could not retrieve video information.")))
 
     duration = info.get("duration") or 0
     formats = info.get("formats", [])
@@ -615,8 +625,9 @@ def execute_download(
 
     opts["progress_hooks"] = [ydl_progress_hook]
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+    def do_download(download_opts):
+        nonlocal locked_total_size
+        with yt_dlp.YoutubeDL(download_opts) as ydl:
             # Step 1: Pre-extract format selection to determine exact/stable combined size
             info = ydl.extract_info(task.url, download=False)
             if not info:
@@ -676,6 +687,23 @@ def execute_download(
             elif os.path.exists(ydl.prepare_filename(info)):
                 task.filepath = os.path.abspath(ydl.prepare_filename(info))
                 task.filename = os.path.basename(task.filepath)
+
+    try:
+        try:
+            do_download(opts)
+        except Exception as primary_err:
+            err_text = str(primary_err).lower()
+            if any(k in err_text for k in ["bot", "player response", "reloaded", "403", "forbidden"]) and not task._cancel_requested:
+                # Automatic bypass fallback using mobile/tv client
+                fallback_opts = opts.copy()
+                fallback_opts["extractor_args"] = {"youtube": {"player_client": ["tv", "mweb", "android"]}}
+                if selected_format_id:
+                    fallback_opts["format"] = f"{selected_format_id}+{audio_stream_selector}/{selected_format_id}/best"
+                else:
+                    fallback_opts["format"] = f"bestvideo+{audio_stream_selector}/best"
+                do_download(fallback_opts)
+            else:
+                raise primary_err
 
         task.status = "finished"
         task.progress = 100.0

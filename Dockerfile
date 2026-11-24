@@ -1,14 +1,21 @@
+# Stage 1: Grab official Deno binary for YouTube EJS challenge solver
+FROM denoland/deno:bin AS deno-bin
+
+# Stage 2: Application container
 FROM python:3.11-slim
 
-# Install system dependencies: ffmpeg, nodejs (required for yt-dlp JavaScript challenge solver)
+# Copy Deno into PATH (enabled by default by yt-dlp to solve YouTube JS challenges)
+COPY --from=deno-bin /deno /usr/local/bin/deno
+
+# Install system dependencies: ffmpeg, curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    nodejs \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python requirements
+# Install Python requirements (including yt-dlp[default] which includes yt-dlp-ejs)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
